@@ -194,20 +194,48 @@ def extract_termsheet(docx_path, groq_client: Groq = None, model: str = DEFAULT_
     )
 
 
+def _write_json(payload: str, out_path: str) -> None:
+    """Write JSON as UTF-8 (no BOM). Use this instead of shell `>` redirection,
+    which on PowerShell produces UTF-16-with-BOM that won't round-trip as JSON."""
+    with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(payload)
+        if not payload.endswith("\n"):
+            fh.write("\n")
+
+
 if __name__ == "__main__":
+    import argparse
+
     from dotenv import load_dotenv
 
     load_dotenv()
 
-    if len(sys.argv) < 2:
-        print("Usage: python termsheet_extractor.py <path-to-termsheet.docx>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Extract structured fields from a partnership term sheet .docx"
+    )
+    parser.add_argument("docx_path", help="Path to the term sheet .docx")
+    parser.add_argument(
+        "-o", "--out",
+        help="Path to write the JSON to (UTF-8). "
+             "Default: <docx-name>_extracted.json next to the input file.",
+    )
+    parser.add_argument(
+        "--stdout", action="store_true",
+        help="Print JSON to stdout only; do not write a file.",
+    )
+    args = parser.parse_args()
 
-    path = sys.argv[1]
     try:
-        data = extract_termsheet(path)
+        data = extract_termsheet(args.docx_path)
     except ExtractionError as e:
         print(f"Extraction failed: {e}")
         sys.exit(1)
 
-    print(json.dumps(data, indent=2))
+    payload = json.dumps(data, indent=2)
+
+    if args.stdout:
+        print(payload)
+    else:
+        out_path = args.out or f"{os.path.splitext(args.docx_path)[0]}_extracted.json"
+        _write_json(payload, out_path)
+        print(f"Wrote {out_path}")
