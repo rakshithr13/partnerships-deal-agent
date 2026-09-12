@@ -26,11 +26,13 @@ Two kinds of function live here:
    licensing-cost model, and the universal tools (profit / NPV / ROI / chart).
    Every one is independently testable with hardcoded values (see __main__).
 
-2. One hybrid function - ``calculate_cloud_hosting_cost`` - which fetches a
-   current per-unit price from the public web (Tavily) and extracts a number from
-   it (Groq), then does a deterministic ``usage x rate`` calculation. Its result
-   is explicitly *directional*: it returns the fetched rate, the source URL, and
-   the raw quoted text next to the number so a human can sanity-check it.
+2. Hybrid functions - ``calculate_cloud_hosting_cost`` and ``fetch_fx_rate`` -
+   which fetch a current price/rate from the public web (Tavily) and extract a
+   number from it (Groq), then (for cloud hosting) do a deterministic
+   ``usage x rate`` calculation. Their results are explicitly *directional*:
+   they return the fetched rate, the source URL, and the raw quoted text next
+   to the number so a human can sanity-check it. ``fetch_fx_rate`` only fetches
+   and labels a reference FX rate - it never converts anything itself.
    ``calculate_licensing_cost`` can *optionally* do a similar rough web lookup,
    but only as a labelled sanity-check - never as a verification.
 
@@ -574,6 +576,145 @@ def calculate_cloud_hosting_cost(provider, usage_assumptions, *, tavily_client=N
             "It is directionally useful only - verify 'fetched_rate' (native published "
             "unit, see 'rate_unit') against the provider's official pricing page "
             "(source_url / raw_quoted_text) before using this number in a real model."
+        ),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# FX rate lookup (HYBRID - fetch + extract, same pattern as the cloud-hosting
+# fetch above): a live reference exchange rate for a cross-border deal.
+# --------------------------------------------------------------------------- #
+
+_FX_RATE_PROMPT = """You are an FX analyst. Below are web search results about the current exchange \
+rate from {from_currency} to {to_currency}.
+
+Search results:
+{results_block}
+
+Return ONLY a JSON object with exactly these keys:
+- "rate": number or null - how many units of {to_currency} one unit of {from_currency} buys, per the \
+results. null if the results do not clearly state a matching rate.
+- "quoted_text": string - the sentence or rate line you took the number from, quoted verbatim. "" if none.
+- "source_result_number": integer or null - which numbered search result above the quote came from.
+
+No markdown, no code fences, no extra keys.
+"""
+
+
+def fetch_fx_rate(from_currency, to_currency, *, tavily_client=None, groq_client=None,
+                  model="openai/gpt-oss-120b", max_results=5):
+    """
+    HYBRID: fetch a current reference FX rate from the web for a cross-border deal.
+
+    Same shape as ``calculate_cloud_hosting_cost``: the *lookup* is non-deterministic
+    (live Tavily search + Groq extraction), so treat the result as **directionally
+    useful, not precise**. The return value carries ``source_url`` and
+    ``raw_quoted_text`` specifically so a human can open the page and verify it.
+
+    This function does not convert or apply the rate to anything - it only fetches
+    and labels it. The caller decides whether/how to use it.
+
+    Parameters
+    ----------
+    from_currency, to_currency : str   ISO 4217-ish codes, e.g. "USD", "EUR".
+    tavily_client, groq_client :       Pre-built clients. If omitted, constructed
+                                       from TAVILY_API_KEY / GROQ_API_KEY.
+    model : str                        Groq model for the extraction step.
+    max_results : int                  Number of Tavily results to feed the extractor.
+
+    Returns
+    -------
+    dict with:
+        from_currency, to_currency : str
+        rate            : float    units of to_currency per 1 unit of from_currency
+        source_url      : str | None
+        raw_quoted_text : str
+        search_query    : str
+        all_sources     : list[dict]  every {title, url} Tavily returned
+        confidence      : "directional"
+        disclaimer      : str
+
+    Raises
+    ------
+    MissingInputError   if from_currency or to_currency is None.
+    FinancialEngineError if no matching rate could be extracted from search results.
+    """
+    _require(from_currency=from_currency, to_currency=to_currency)
+    from_currency = str(from_currency).strip().upper()
+    to_currency = str(to_currency).strip().upper()
+
+    if tavily_client is None:
+        from tavily import TavilyClient
+        api_key = os.getenv("TAVILY_API_KEY")
+        if not api_key:
+            raise FinancialEngineError("TAVILY_API_KEY is not set and no tavily_client was provided")
+        tavily_client = TavilyClient(api_key=api_key)
+
+    if groq_client is None:
+        from groq import Groq
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise FinancialEngineError("GROQ_API_KEY is not set and no groq_client was provided")
+        groq_client = Groq(api_key=api_key)
+
+    query = f"{from_currency} to {to_currency} exchange rate today"
+    search = tavily_client.search(query=query, max_results=max_results)
+    results = search.get("results", []) if isinstance(search, dict) else []
+    if not results:
+        raise FinancialEngineError(f"Tavily returned no results for query: {query!r}")
+
+    results_block = "\n\n".join(
+        f"[{i}] {r.get('title', '(no title)')}\n"
+        f"URL: {r.get('url', '')}\n"
+        f"{(r.get('content') or '').strip()}"
+        for i, r in enumerate(results, start=1)
+    )
+    all_sources = [{"title": r.get("title", ""), "url": r.get("url", "")} for r in results]
+
+    prompt = _FX_RATE_PROMPT.format(
+        from_currency=from_currency, to_currency=to_currency, results_block=results_block,
+    )
+
+    parsed = None
+    for _attempt in range(2):
+        response = groq_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+        try:
+            parsed = json.loads(response.choices[0].message.content)
+            break
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    if not isinstance(parsed, dict) or parsed.get("rate") is None:
+        raise FinancialEngineError(
+            f"Could not extract a matching {from_currency}->{to_currency} rate from the search "
+            "results. The caller should ask the user to supply the rate manually or check a live "
+            "FX source directly."
+        )
+
+    rate = _number("rate", parsed["rate"])
+    src_num = parsed.get("source_result_number")
+    source_url = None
+    if isinstance(src_num, int) and 1 <= src_num <= len(results):
+        source_url = results[src_num - 1].get("url")
+
+    return {
+        "from_currency": from_currency,
+        "to_currency": to_currency,
+        "rate": rate,
+        "source_url": source_url,
+        "raw_quoted_text": str(parsed.get("quoted_text", "")).strip(),
+        "search_query": query,
+        "all_sources": all_sources,
+        "confidence": "directional",
+        "disclaimer": (
+            "Rate was fetched from a public web search and extracted by an LLM. It is "
+            "directionally useful only - verify it against a live FX source (e.g. your bank, "
+            "XE.com, or a market data terminal) before relying on it for a real decision."
         ),
     }
 
@@ -1169,7 +1310,7 @@ def _pl_records(pl_data):
     return records
 
 
-def generate_pl_chart(pl_data, *, title="Partnership P&L (annual)"):
+def generate_pl_chart(pl_data, *, title="Partnership P&L (annual)", currency_symbol="$"):
     """
     Build a grouped-bar P&L chart as an Altair chart object.
 
@@ -1188,6 +1329,10 @@ def generate_pl_chart(pl_data, *, title="Partnership P&L (annual)"):
         ``{"revenue": 100, "opex": 60, "capex": 20, "net_profit": 20}``
       (rendered as one period labelled "Total")
 
+    currency_symbol : str
+        Prefix shown in the y-axis title and tooltip label (e.g. "$", "€", "INR ").
+        Purely cosmetic - the amounts themselves are plotted as given.
+
     Returns
     -------
     altair.Chart
@@ -1202,19 +1347,20 @@ def generate_pl_chart(pl_data, *, title="Partnership P&L (annual)"):
 
     period_order = list(dict.fromkeys(df["period"]))
     series_order = list(dict.fromkeys(df["series"]))
+    amount_title = f"Amount ({currency_symbol.strip()})"
 
     return (
         alt.Chart(df)
         .mark_bar()
         .encode(
-            x=alt.X("period:N", sort=period_order, title=None),
+            x=alt.X("period:N", sort=period_order, title=None, axis=alt.Axis(labelAngle=0)),
             xOffset=alt.XOffset("series:N", sort=series_order),
-            y=alt.Y("amount:Q", title="Amount"),
+            y=alt.Y("amount:Q", title=amount_title),
             color=alt.Color("series:N", sort=series_order, title="Line item"),
             tooltip=[
                 alt.Tooltip("period:N", title="Period"),
                 alt.Tooltip("series:N", title="Line item"),
-                alt.Tooltip("amount:Q", title="Amount", format=",.2f"),
+                alt.Tooltip("amount:Q", title=amount_title, format=",.2f"),
             ],
         )
         .properties(title=title, height=360)

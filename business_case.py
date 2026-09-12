@@ -4,14 +4,17 @@ Business-case flow helpers.
 Non-UI logic for the conversational business-case builder:
 
 1. classify_business_model()          - Groq picks one of the four models + why.
-2. MODEL_INPUT_SPECS / required_fields - which financial_engine inputs a model needs.
-3. prefill_inputs_from_extraction()   - deterministic pre-fill from the term sheet.
-4. propose_assumptions()              - Groq drafts clearly-labelled defaults for the
-                                        fields the term sheet doesn't cover (fallback
-                                        table if Groq is unavailable).
-5. run_scenarios()                    - Low / Medium / High by multiplying the model's
-                                        driver(s), calling the matched financial_engine
-                                        function each time.
+   extraction_signals_for_model()     - deterministic check that a chosen/overridden
+                                        model is actually supported by the contract text.
+2. MODEL_GRID_ROWS / prefill_grid_cells / propose_grid_assumptions
+                                       - the Step 2 year-by-year input grid: which rows
+                                        a model needs, deterministic pre-fill from the
+                                        term sheet, and Groq-drafted (ramped, not flat)
+                                        assumptions for whatever's still blank.
+3. build_pl_from_grid()               - per-year Revenue/CAPEX/OPEX straight from the
+                                        confirmed grid, run through calculate_profit.
+4. compute_npv_roi()                  - NPV/ROI from a built P&L (build_pl_from_grid's
+                                        output).
 
 No Streamlit import. The Streamlit tab owns all session-state and widgets and calls
 into these. All period conventions are annual, matching financial_engine.
@@ -21,12 +24,13 @@ from __future__ import annotations
 
 import json
 
+import pandas as pd
+
 from financial_engine import (
-    FinancialEngineError,
-    calculate_adtech_revenue,
-    calculate_fee_based_revenue,
     calculate_licensing_cost,
-    calculate_subscription_revenue,
+    calculate_npv,
+    calculate_profit,
+    calculate_roi,
     derive_licensing_inputs_from_extraction,
 )
 
@@ -40,6 +44,28 @@ MODEL_LABELS = {
 }
 
 DEFAULT_MODEL = "openai/gpt-oss-120b"
+
+# --------------------------------------------------------------------------- #
+# Currency
+# --------------------------------------------------------------------------- #
+
+CURRENCY_CHOICES = ("USD", "EUR", "GBP", "Other")
+
+CURRENCY_SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£"}
+
+
+def currency_symbol(code: str) -> str:
+    """
+    Display prefix for a currency code - concatenate directly before a number.
+
+    Known codes (USD/EUR/GBP) return their symbol ("$", "€", "£"); anything
+    else (a user-typed code like "INR" or "AUD") returns "<CODE> " so the
+    amount reads e.g. "INR 1,234" rather than guessing a symbol.
+    """
+    if not code:
+        return "$"
+    code = code.strip().upper()
+    return CURRENCY_SYMBOLS.get(code, f"{code} ")
 
 
 class BusinessCaseError(Exception):
@@ -58,6 +84,10 @@ deal as exactly one of:
 - "fee_based": the partner earns a flat fee per exposure unit (per vehicle, per transaction, per API call, per device) with no CPM/CPC and no recurring-subscriber mechanic.
 - "licensing": one party pays another a software / IP licence fee (flat, per-unit royalty, or tiered) - e.g. an OEM licensing a chip/software platform.
 
+Also identify the deal's currency and whether it looks cross-border (the provider and the \
+counterparty/OEM appear to sit in different currency regions - e.g. different currency symbols/codes \
+used in the text, or party names/context implying different home countries).
+
 Extracted term sheet (JSON):
 {extraction_json}
 
@@ -69,6 +99,14 @@ Return ONLY a JSON object with exactly these keys:
 - "reasoning": 1-3 sentences citing the specific term-sheet language (revenue share, fees, volume basis, IP terms) that drove the choice.
 - "signals": array of short strings - the concrete phrases/fields that point to this model.
 - "confidence": "high", "medium", or "low".
+- "currency": ISO 4217 code (e.g. "USD", "EUR", "GBP") the money amounts are stated in, or null if the \
+term sheet never states or implies a currency.
+- "cross_border": true or false - true only if you can point to actual evidence the two parties are in \
+different currency regions.
+- "counterparty_currency": if cross_border is true, the OTHER party's likely ISO 4217 currency code; \
+else null.
+- "currency_reasoning": one short sentence backing the currency/cross_border call, or "" if "currency" \
+is null and cross_border is false.
 
 No markdown, no code fences, no extra keys.
 """
@@ -96,9 +134,12 @@ def _groq_json(groq_client, prompt, model, *, attempts=2):
 
 def classify_business_model(extraction: dict, risks: list, groq_client, model: str = DEFAULT_MODEL) -> dict:
     """
-    Ask Groq to classify the deal as one of BUSINESS_MODELS.
+    Ask Groq to classify the deal as one of BUSINESS_MODELS, and - in the same
+    call - detect the deal's stated currency and whether it looks cross-border.
 
-    Returns {"business_model", "reasoning", "signals": [...], "confidence"}.
+    Returns {"business_model", "reasoning", "signals": [...], "confidence",
+    "currency": str|None, "cross_border": bool, "counterparty_currency": str|None,
+    "currency_reasoning": str}.
     Raises BusinessCaseError if the model returns an unusable answer.
     """
     risk_names = [r.get("risk_name", "") for r in (risks or [])]
@@ -116,11 +157,24 @@ def classify_business_model(extraction: dict, risks: list, groq_client, model: s
     if not isinstance(signals, list):
         signals = [str(signals)]
 
+    currency = parsed.get("currency")
+    currency = str(currency).strip().upper() if isinstance(currency, str) and currency.strip() else None
+
+    counterparty_currency = parsed.get("counterparty_currency")
+    counterparty_currency = (
+        str(counterparty_currency).strip().upper()
+        if isinstance(counterparty_currency, str) and counterparty_currency.strip() else None
+    )
+
     return {
         "business_model": bm,
         "reasoning": str(parsed.get("reasoning", "")).strip(),
         "signals": [str(s).strip() for s in signals if str(s).strip()],
         "confidence": str(parsed.get("confidence", "")).strip().lower() or "unknown",
+        "currency": currency,
+        "cross_border": bool(parsed.get("cross_border")),
+        "counterparty_currency": counterparty_currency,
+        "currency_reasoning": str(parsed.get("currency_reasoning", "")).strip(),
     }
 
 
@@ -134,7 +188,7 @@ def classify_business_model(extraction: dict, risks: list, groq_client, model: s
 
 _MODEL_SIGNAL_KEYWORDS = {
     "subscription": [
-        "subscription", "subscriber", "churn", "activation", "recurring",
+        "subscription", "subscriber", "churn", "activation rate", "recurring",
         "monthly fee", "monthly subscription", "per active", "per seat", "per-seat",
         "per user", "per-user", "mrr", "arr", "retention",
     ],
@@ -146,8 +200,7 @@ _MODEL_SIGNAL_KEYWORDS = {
     "fee_based": [
         "flat fee", "fee per", "per-unit fee", "per unit fee", "per vehicle",
         "per transaction", "per device", "per api", "per call", "per connected",
-        "usage fee", "usage-based", "per activation fee", "per-unit license fee",
-        "per-unit licence fee",
+        "usage fee", "usage-based", "per activation fee",
     ],
     "licensing": [
         "licens", "royalt", "intellectual property", "ip ownership", "sublicens",
@@ -199,196 +252,251 @@ def extraction_signals_for_model(business_model: str, extraction: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# 2. Input specs per model
+# 2. Year-by-year input grid (Step 2)
 # --------------------------------------------------------------------------- #
 #
-# kind:  "count" | "money" | "rate" (0-1) | "years" | "choice" | "tiers"
-# prefill: key in prefill_inputs_from_extraction()'s output this field maps to.
+# Step 2 of the Streamlit flow gathers inputs as an editable Year 0..N grid
+# (st.data_editor) instead of one flat number per field. Each row is one driver;
+# each cell tracks its own state: "prefilled" (from the term sheet), "user"
+# (typed in), "assumed" (accepted industry-standard proposal), "computed"
+# (rolled forward automatically - the subscription waterfall), or "blank".
+#
+# kind drives both the fallback ramp heuristic and (for subscription) whether the
+# row is user-editable at all:
+#   "volume" | "churn" | "rate" | "capex" | "opex"  - normal editable/assumable rows
+#   "seed"                                           - editable ONLY at Year 0;
+#                                                       later years roll forward
+#   "computed"                                       - never editable, never assumed
 
-MODEL_INPUT_SPECS = {
+MODEL_GRID_ROWS = {
     "subscription": [
-        {"name": "new_customers_per_year", "label": "New customers acquired per year",
-         "kind": "count", "prefill": "annual_volume",
-         "help": "Prospective customers reached per year, before activation."},
-        {"name": "price", "label": "Annual revenue per active customer ($)", "kind": "money",
-         "help": "What the partner earns per active customer per year."},
-        {"name": "activation_rate", "label": "Activation rate (0-1)", "kind": "rate",
-         "help": "Fraction of new customers who actually start a subscription."},
-        {"name": "annual_churn_rate", "label": "Annual churn rate (0-1)", "kind": "rate",
-         "help": "Fraction of the active base lost per year."},
-        {"name": "duration_years", "label": "Term (years)", "kind": "years", "prefill": "duration_years"},
+        {"name": "beginning_base", "label": "Beginning subscriber base", "kind": "seed",
+         "help": "Active subscribers at the start of the year. Year 0 is the deal's "
+                 "starting point (0 for a brand-new partnership); later years roll "
+                 "forward automatically from the prior year's ending base."},
+        {"name": "new_added", "label": "New subscribers added", "kind": "volume",
+         "prefill": "annual_volume", "help": "New subscribers who start in the year."},
+        {"name": "churned_out", "label": "Subscribers churned out", "kind": "churn",
+         "help": "Active subscribers lost during the year."},
+        {"name": "ending_base", "label": "Ending subscriber base", "kind": "computed",
+         "help": "= Beginning base + New subscribers - Churned out. Computed automatically."},
+        {"name": "price", "label": "Annual fee per subscriber ({cur})", "kind": "rate",
+         "help": "What the partner earns per active subscriber per year."},
     ],
     "adtech": [
-        {"name": "annual_impressions", "label": "Ad impressions per year", "kind": "count"},
-        {"name": "cpm_rate", "label": "Revenue per 1,000 impressions — CPM ($)", "kind": "money"},
-        {"name": "annual_clicks", "label": "Clicks per year", "kind": "count"},
-        {"name": "cpc_rate", "label": "Revenue per click — CPC ($)", "kind": "money"},
-        {"name": "duration_years", "label": "Term (years)", "kind": "years", "prefill": "duration_years"},
+        {"name": "annual_impressions", "label": "Ad impressions", "kind": "volume"},
+        {"name": "cpm_rate", "label": "CPM rate ({cur} / 1,000 impressions)", "kind": "rate"},
+        {"name": "annual_clicks", "label": "Clicks", "kind": "volume"},
+        {"name": "cpc_rate", "label": "CPC rate ({cur} / click)", "kind": "rate"},
     ],
     "fee_based": [
-        {"name": "annual_exposure_units", "label": "Billable exposure units per year",
-         "kind": "count", "prefill": "annual_volume",
-         "help": "Vehicles / transactions / devices / API calls billed per year."},
-        {"name": "rate_per_unit", "label": "Fee per unit ($)", "kind": "money"},
-        {"name": "duration_years", "label": "Term (years)", "kind": "years", "prefill": "duration_years"},
+        {"name": "annual_exposure_units", "label": "Annual unit volume (vehicles / transactions / devices)",
+         "kind": "volume", "prefill": "annual_volume",
+         "help": "Vehicles / transactions / devices / API calls billed in the year."},
+        {"name": "rate_per_unit", "label": "Fee per unit ({cur})", "kind": "rate"},
     ],
     "licensing": [
-        {"name": "license_model_type", "label": "Licence structure", "kind": "choice",
-         "choices": ["flat", "per_unit", "tiered"]},
-        {"name": "flat_fee", "label": "Annual flat licence fee ($)", "kind": "money",
-         "needs_type": ["flat"]},
-        {"name": "per_unit_fee", "label": "Royalty per licensed unit ($)", "kind": "money",
-         "needs_type": ["per_unit"]},
-        {"name": "tier_breaks", "label": "Tier breaks (units → rate/unit)", "kind": "tiers",
-         "needs_type": ["tiered"]},
-        {"name": "volume", "label": "Total licensed units over the term", "kind": "count",
-         "prefill": "total_volume", "needs_type": ["per_unit", "tiered"]},
-        {"name": "duration_years", "label": "Term (years)", "kind": "years", "prefill": "duration_years"},
+        # Always present, even for a flat-fee structure with no per-unit math -
+        # a licence deal still has a volume of licensed units worth tracking.
+        {"name": "volume", "label": "Licensed volume", "kind": "volume", "prefill": "annual_volume"},
+        {"name": "rate_or_fee", "label": "Royalty per licensed unit ({cur})", "kind": "rate"},
     ],
 }
 
+GRID_CAPEX_ROW = {"name": "capex", "label": "Upfront / setup cost — CAPEX ({cur})", "kind": "capex",
+                  "help": "One-time build / integration cost recognised in that year "
+                          "(e.g. tooling, integration work, platform setup). This is the "
+                          "deal's CAPEX line."}
 
-def required_fields(business_model: str, inputs: dict) -> list:
+DEFAULT_OPEX_LABEL = "Ongoing operating cost — OPEX ({cur})"
+
+
+def apply_currency_label(label: str, symbol: str) -> str:
+    """Substitute the "{cur}" placeholder in a default row label with the
+    actual currency prefix (e.g. "$", "EUR "). Labels without the placeholder
+    (counts, and any user-renamed label) pass through unchanged."""
+    return label.replace("{cur}", symbol.strip()) if "{cur}" in label else label
+
+
+def default_grid_years(extraction: dict) -> int:
+    """Whole-year projection horizon default: the contract term, else 3 years."""
+    derived = derive_licensing_inputs_from_extraction(extraction)
+    dur = derived.get("duration_years")
+    if dur:
+        return max(1, int(round(dur)))
+    return 3
+
+
+def prefill_grid_cells(business_model: str, extraction: dict, row_specs: list, n_years: int) -> dict:
     """
-    Field names the matched financial_engine function needs, given the current inputs.
+    Deterministic pre-fill of grid cells from the term sheet extraction.
 
-    For licensing this depends on the chosen ``license_model_type`` (flat needs
-    flat_fee only; per_unit needs per_unit_fee + volume; tiered needs tier_breaks +
-    volume).
-    """
-    specs = MODEL_INPUT_SPECS[business_model]
-    lm_type = inputs.get("license_model_type")
-    out = []
-    for spec in specs:
-        needs = spec.get("needs_type")
-        if needs is not None and lm_type not in needs:
-            continue
-        out.append(spec["name"])
-    return out
+    Only the row(s) tagged ``prefill="annual_volume"`` get filled, spreading the
+    term sheet's per-year minimum-volume figure evenly across Years 1..N (Year 0
+    is left blank - it's the setup year, before the commitment starts). Nothing
+    else is guessed here; that's what the assumption engine is for.
 
-
-def missing_fields(business_model: str, inputs: dict) -> list:
-    """Required field names whose value is currently None / empty."""
-    out = []
-    for name in required_fields(business_model, inputs):
-        val = inputs.get(name)
-        if val is None or (name == "tier_breaks" and not val):
-            out.append(name)
-    return out
-
-
-# --------------------------------------------------------------------------- #
-# 3. Deterministic pre-fill from the term sheet extraction
-# --------------------------------------------------------------------------- #
-
-def prefill_inputs_from_extraction(business_model: str, extraction: dict) -> dict:
-    """
-    Deterministic pre-fill of engine inputs from an already-extracted term sheet.
-
-    Returns ``{field_name: {"value": <number>, "source": "<human note>"}}`` for the
-    fields the term sheet actually addresses (duration, volume / minimum commitment).
-    Anything not derivable is simply absent - the caller then asks the user or offers
-    a labelled assumption. Never guesses.
+    Returns ``{row_name: {year_idx: {"value": float, "source": str}}}``.
     """
     derived = derive_licensing_inputs_from_extraction(extraction)
-    out = {}
-
-    dur = derived.get("duration_years")
-    if dur is not None:
-        months = extraction.get("contract_duration_months")
-        out["duration_years"] = {
-            "value": dur,
-            "source": f"term sheet: contract_duration_months = {months} → {dur:g} years",
-        }
-
     per_year = derived.get("volume_per_year")
-    total = derived.get("volume")
     src_text = derived.get("volume_source_text")
 
-    specs = MODEL_INPUT_SPECS[business_model]
-    for spec in specs:
-        pf = spec.get("prefill")
-        if pf == "annual_volume" and per_year is not None:
+    out = {}
+    if per_year is None:
+        return out
+    for spec in row_specs:
+        if spec.get("prefill") == "annual_volume":
             out[spec["name"]] = {
-                "value": per_year,
-                "source": f"term sheet minimum_volume: {src_text!r} → {per_year:g}/year "
-                          f"(verify this maps to '{spec['name']}')",
+                y: {"value": per_year,
+                    "source": f"term sheet minimum_volume: {src_text!r} -> {per_year:g}/year"}
+                for y in range(1, n_years + 1)
             }
-        elif pf == "total_volume" and total is not None:
-            out[spec["name"]] = {
-                "value": total,
-                "source": f"term sheet minimum_volume: {src_text!r} → {total:g} over the term "
-                          "(MINIMUM commitment — actual may be higher)",
-            }
-
     return out
 
 
-# --------------------------------------------------------------------------- #
-# 4. Proposed assumptions for the remaining fields
-# --------------------------------------------------------------------------- #
+def recompute_subscription_waterfall(values: dict, n_years: int) -> None:
+    """
+    In-place roll-forward of the subscription waterfall.
 
-# Used only if Groq is unavailable / unusable. Value is None where a number simply
-# cannot be guessed from industry standards (e.g. a price, a raw volume) — those
-# stay missing and the user must supply them.
-_FALLBACK_ASSUMPTIONS = {
-    "activation_rate": (0.30, "Industry default: a newly launched paid feature typically activates ~25-35% of reached customers."),
-    "annual_churn_rate": (0.15, "Industry default: consumer subscription annual churn commonly runs 15-20%; 15% used as a mid-point."),
-    "cpm_rate": (3.0, "Industry default: blended display CPM commonly $2-5."),
-    "cpc_rate": (0.60, "Industry default: blended display CPC commonly $0.40-0.80."),
-    "duration_years": (3.0, "Industry default: initial partnership terms are commonly 3 years."),
-    "price": (None, "A per-customer price cannot be assumed from industry standards — needs a real figure."),
-    "rate_per_unit": (None, "A per-unit fee cannot be assumed — needs a real figure or the negotiated rate."),
-    "per_unit_fee": (None, "A per-unit royalty cannot be assumed — needs the negotiated rate."),
-    "flat_fee": (None, "A flat licence fee cannot be assumed — needs the negotiated figure."),
-    "new_customers_per_year": (None, "Reach/volume cannot be assumed — needs a real figure or the term-sheet minimum."),
-    "annual_exposure_units": (None, "Exposure volume cannot be assumed — needs a real figure or the term-sheet minimum."),
-    "annual_impressions": (None, "Impression volume cannot be assumed — needs a real figure or a media plan."),
-    "annual_clicks": (None, "Click volume cannot be assumed — needs a real figure or an assumed CTR on impressions."),
+    ``beginning_base[0]`` is whatever the caller has (0 if unset); every later
+    year's beginning base is the prior year's ending base. Ending base is always
+    ``beginning + new_added - churned_out`` (missing new/churn treated as 0 for
+    this arithmetic, independent of their blank/assumed state).
+    """
+    beg = values.setdefault("beginning_base", [None] * (n_years + 1))
+    new = values.get("new_added") or [None] * (n_years + 1)
+    churn = values.get("churned_out") or [None] * (n_years + 1)
+    end = values.setdefault("ending_base", [None] * (n_years + 1))
+
+    for y in range(n_years + 1):
+        b = beg[y] if y == 0 else end[y - 1]
+        b = b or 0.0
+        beg[y] = b
+        n = (new[y] if y < len(new) else None) or 0.0
+        c = (churn[y] if y < len(churn) else None) or 0.0
+        end[y] = b + n - c
+
+
+# Annual ramp applied when projecting a known value into a blank year.
+_GRID_RAMP_RATE = {"volume": 0.08, "rate": 0.03, "opex": 0.03, "churn": 0.0, "capex": 0.0, "seed": 0.0}
+
+# Used only when a row has NO known value anywhere to anchor a projection from.
+_GRID_BASELINE = {
+    "volume": (10_000.0, "No volume signal available anywhere on this row - a generic starting "
+                         "volume of 10,000/year is used, ramping ~8%/yr thereafter."),
+    "churn": (0.0, "No churn signal available - assumed 0 for this year."),
+    "rate": (75.0, "No pricing signal available - a generic $75/unit industry placeholder is used; "
+                   "replace with the negotiated rate."),
+    "capex": (200_000.0, "No CAPEX signal available - a generic $200k build/integration placeholder "
+                         "is used, booked in Year 0."),
+    "opex": (50_000.0, "No OPEX signal available - a generic $50k/yr placeholder is used."),
+    "seed": (0.0, "New partnership - assumed no existing active base at Year 0."),
 }
 
-_ASSUMPTIONS_PROMPT = """You are a partnerships financial analyst. For a {business_model} deal we still \
-need values for these inputs (financial_engine, annual periods):
 
-{missing_block}
+def _fallback_grid_cell(kind: str, row_label: str, year_idx: int, row_values: list):
+    """Deterministic (no-Groq) ramped proposal for one blank cell. Returns (value, rationale)."""
+    if kind == "capex" and year_idx != 0:
+        return 0.0, "CAPEX is treated as a one-time Year 0 spend; no further CAPEX assumed."
+
+    known = [(y, v) for y, v in enumerate(row_values) if v is not None]
+    ramp = _GRID_RAMP_RATE.get(kind, 0.0)
+
+    if known:
+        nearest_y, nearest_v = min(known, key=lambda yv: abs(yv[0] - year_idx))
+        value = nearest_v * ((1.0 + ramp) ** (year_idx - nearest_y))
+        if ramp:
+            direction = "growing" if year_idx >= nearest_y else "stepping back"
+            rationale = (f"Projected from the known {row_label} value in Year {nearest_y} "
+                        f"({nearest_v:,.2f}), {direction} {abs(ramp):.0%}/yr.")
+        else:
+            rationale = f"Held flat at the known {row_label} value from Year {nearest_y} ({nearest_v:,.2f})."
+        return value, rationale
+
+    base_val, base_reason = _GRID_BASELINE.get(kind, (0.0, "No standard default available."))
+    if ramp and year_idx > 0:
+        return base_val * ((1.0 + ramp) ** year_idx), base_reason
+    return base_val, base_reason
+
+
+_GRID_ASSUMPTIONS_PROMPT = """You are a partnerships financial analyst building a year-by-year plan for a \
+{business_model} deal, covering Year 0 through Year {n_years}.
+
+For each row below, some year values are already known (from the term sheet or the user); others are \
+blank and need a proposed figure. Propose values that reasonably evolve year to year (e.g. volume \
+ramping up, price stepping up modestly) rather than repeating one flat number, and stay consistent with \
+any known values already on that row.
+
+Rows (JSON):
+{rows_json}
 
 Commercial context from the term sheet:
 {context_json}
 
-Propose a reasonable INDUSTRY-STANDARD default for each field you can. If a field cannot \
-responsibly be assumed from industry norms (e.g. a specific price or a raw traffic volume), \
-return its value as null and say so in the rationale.
-
-Return ONLY a JSON object mapping each field name to an object:
-  "<field>": {{ "value": <number or null>, "rationale": "<one sentence: the standard range or the term it is based on>" }}
-
-Rates (activation_rate, annual_churn_rate) must be between 0 and 1. No markdown, no code fences, no extra keys.
+Return ONLY a JSON object shaped like:
+{{
+  "<row_name>": {{
+    "<year_index>": {{ "value": <number>, "rationale": "<one sentence>" }},
+    ...
+  }},
+  ...
+}}
+Include an entry for every blank year index listed for every row. Values must be numbers >= 0. \
+No markdown, no code fences, no extra keys.
 """
 
-_RATE_FIELDS = {"activation_rate", "annual_churn_rate"}
 
-
-def propose_assumptions(business_model: str, extraction: dict, missing: list, groq_client,
-                        model: str = DEFAULT_MODEL) -> dict:
+def propose_grid_assumptions(business_model: str, extraction: dict, row_specs: list, values: dict,
+                             states: dict, n_years: int, groq_client, model: str = DEFAULT_MODEL) -> dict:
     """
-    Draft clearly-labelled default assumptions for the still-missing fields.
+    Propose a value for every still-blank cell in the grid, reasoning about how a
+    value might reasonably change year to year rather than repeating one flat
+    number. Nothing is left as ``None`` here - the caller shows every proposal to
+    the user for Yes/Edit review, so a labelled industry-generic placeholder (with
+    an honest rationale) is preferable to a gap.
 
-    Returns ``{field: {"value": <number|None>, "rationale": str, "source": "groq"|"fallback"}}``
-    for every field in ``missing``. The caller MUST show each to the user and only
-    apply the ones the user individually accepts — nothing here is auto-applied.
+    "computed" rows (the subscription waterfall's ending_base, and beginning_base
+    beyond Year 0) are never targeted - they're always derived, never assumed.
+
+    Returns ``{row_name: {year_idx: {"value": float, "rationale": str}}}`` - only
+    for cells that were actually blank.
     """
-    if not missing:
+    assumable = [r for r in row_specs if r["kind"] != "computed"]
+    targets = {}
+    for r in assumable:
+        name = r["name"]
+        row_states = states.get(name) or []
+        blanks = [y for y in range(n_years + 1)
+                  if y < len(row_states) and row_states[y] == "blank"
+                  and not (r["kind"] == "seed" and y > 0)]
+        if blanks:
+            targets[name] = blanks
+    if not targets:
         return {}
 
-    labels = {s["name"]: s["label"] for s in MODEL_INPUT_SPECS[business_model]}
+    rows_payload = []
+    for r in assumable:
+        name = r["name"]
+        if name not in targets:
+            continue
+        row_vals = values.get(name) or []
+        known = {y: row_vals[y] for y in range(n_years + 1)
+                 if y < len(row_vals) and row_vals[y] is not None and y not in targets[name]}
+        rows_payload.append({
+            "name": name, "label": r["label"], "kind": r["kind"],
+            "known": {str(y): v for y, v in known.items()},
+            "blank_years": targets[name],
+        })
+
     context = {
         k: extraction.get(k)
         for k in ("partner_name", "revenue_share", "revenue_share_details", "minimum_volume",
                   "payment_terms", "exclusivity", "contract_duration_months", "IP_Ownership")
     }
-    prompt = _ASSUMPTIONS_PROMPT.format(
-        business_model=business_model,
-        missing_block="\n".join(f"- {m} ({labels.get(m, m)})" for m in missing),
+    prompt = _GRID_ASSUMPTIONS_PROMPT.format(
+        business_model=business_model, n_years=n_years,
+        rows_json=json.dumps(rows_payload, indent=2),
         context_json=json.dumps(context, indent=2),
     )
 
@@ -399,186 +507,349 @@ def propose_assumptions(business_model: str, extraction: dict, missing: list, gr
         parsed = {}
 
     out = {}
-    for field in missing:
-        entry = parsed.get(field) if isinstance(parsed, dict) else None
-        value, rationale, source = None, "", "fallback"
-
-        if isinstance(entry, dict) and "value" in entry:
-            value = entry.get("value")
-            rationale = str(entry.get("rationale", "")).strip()
-            source = "groq"
-            if not isinstance(value, (int, float)) or isinstance(value, bool):
-                value = None
-
-        if value is None and source != "groq":
-            fb = _FALLBACK_ASSUMPTIONS.get(field)
-            if fb is not None:
-                value, rationale = fb
-                rationale = rationale or ""
-
-        if value is not None:
-            value = float(value)
-            if field in _RATE_FIELDS:
-                value = min(1.0, max(0.0, value))
-
-        out[field] = {
-            "value": value,
-            "rationale": rationale or "No industry-standard default available — please supply a real figure.",
-            "source": source,
-        }
+    for r in assumable:
+        name = r["name"]
+        if name not in targets:
+            continue
+        row_out = {}
+        groq_row = parsed.get(name) if isinstance(parsed, dict) else None
+        row_vals = values.get(name) or []
+        for y in targets[name]:
+            entry = None
+            if isinstance(groq_row, dict):
+                entry = groq_row.get(str(y))
+                if entry is None:
+                    entry = groq_row.get(y)
+            value, rationale = None, ""
+            if isinstance(entry, dict) and isinstance(entry.get("value"), (int, float)) \
+               and not isinstance(entry.get("value"), bool):
+                value = float(entry["value"])
+                rationale = str(entry.get("rationale", "")).strip()
+            if value is None:
+                value, rationale = _fallback_grid_cell(r["kind"], r["label"], y, row_vals)
+            row_out[y] = {"value": max(0.0, value), "rationale": rationale or "Industry-standard estimate."}
+        out[name] = row_out
     return out
 
 
 # --------------------------------------------------------------------------- #
-# 5. Low / Medium / High scenarios
+# 2b. Readable one-line-per-row summary of a row's assumed cells, for the
+#     "Here are the assumptions I've made" review - detects whether the
+#     assumed values across years form a flat / linear / percentage-growth
+#     pattern before falling back to listing individual years.
 # --------------------------------------------------------------------------- #
 
-SCENARIO_NAMES = ("low", "medium", "high")
+_MONEY_ROW_KINDS = {"rate", "capex", "opex"}
 
-# field -> (low_multiplier, medium_multiplier, high_multiplier), tuned so "low" is
-# the pessimistic revenue/most-costly case.
-SCENARIO_MULTIPLIERS = {
-    "subscription": {
-        "activation_rate": (0.8, 1.0, 1.2),
-        "annual_churn_rate": (1.25, 1.0, 0.8),
-    },
-    "adtech": {
-        "annual_impressions": (0.8, 1.0, 1.2),
-        "annual_clicks": (0.8, 1.0, 1.2),
-    },
-    "fee_based": {
-        "annual_exposure_units": (0.8, 1.0, 1.2),
-    },
-    "licensing": {
-        "volume": (0.8, 1.0, 1.2),
-    },
-}
-
-_HEADLINE_KEY = {
-    "subscription": "total_revenue",
-    "adtech": "total_revenue",
-    "fee_based": "total_revenue",
-    "licensing": "licensing_cost",
-}
-
-_HEADLINE_LABEL = {
-    "subscription": "Total revenue over the term",
-    "adtech": "Total revenue over the term",
-    "fee_based": "Total revenue over the term",
-    "licensing": "Total licensing cost over the term (paid by the OEM)",
-}
+_FLAT_TOL = 0.02      # relative deviation from the mean still counts as "flat"
+_SLOPE_TOL = 0.05     # relative-to-scale tolerance for a consistent $/yr step
+_RATIO_TOL = 0.02     # absolute tolerance (e.g. 0.02 == 2 percentage points) on the growth ratio
 
 
-def _call_engine(business_model: str, inputs: dict):
-    if business_model == "subscription":
-        return calculate_subscription_revenue(
-            new_customers_per_year=inputs.get("new_customers_per_year"),
-            price=inputs.get("price"),
-            activation_rate=inputs.get("activation_rate"),
-            annual_churn_rate=inputs.get("annual_churn_rate"),
-            duration_years=inputs.get("duration_years"),
-        )
-    if business_model == "adtech":
-        return calculate_adtech_revenue(
-            annual_impressions=inputs.get("annual_impressions"),
-            cpm_rate=inputs.get("cpm_rate"),
-            annual_clicks=inputs.get("annual_clicks"),
-            cpc_rate=inputs.get("cpc_rate"),
-            duration_years=inputs.get("duration_years"),
-        )
-    if business_model == "fee_based":
-        return calculate_fee_based_revenue(
-            annual_exposure_units=inputs.get("annual_exposure_units"),
-            rate_per_unit=inputs.get("rate_per_unit"),
-            duration_years=inputs.get("duration_years"),
-        )
-    if business_model == "licensing":
-        return calculate_licensing_cost(
-            model_type=inputs.get("license_model_type"),
-            flat_fee=inputs.get("flat_fee"),
-            per_unit_fee=inputs.get("per_unit_fee"),
-            volume=inputs.get("volume"),
-            duration_years=inputs.get("duration_years"),
-            tier_breaks=inputs.get("tier_breaks"),
-        )
-    raise BusinessCaseError(f"Unknown business_model: {business_model!r}")
-
-
-def run_scenarios(business_model: str, inputs: dict) -> dict:
+def _detect_row_pattern(points: list):
     """
-    Run the matched financial_engine function three times — Low / Medium / High —
-    by multiplying the model's driver field(s).
+    points: [(year, value), ...] sorted by year, at least one point, values >= 0.
 
-    Drivers:
-      - subscription : activation_rate (x0.8/1.0/1.2) and annual_churn_rate (x1.25/1.0/0.8)
-      - adtech       : annual_impressions and annual_clicks (x0.8/1.0/1.2)
-      - fee_based    : annual_exposure_units (x0.8/1.0/1.2)
-      - licensing    : volume (x0.8/1.0/1.2); a flat-fee licence has no volume driver,
-                       so Low/High there reflect +/-10% fee-negotiation uncertainty.
+    Returns one of:
+        {"kind": "single", "year": int, "value": float}
+        {"kind": "flat", "value": float}
+        {"kind": "linear", "start_value": float, "slope": float}
+        {"kind": "percent", "start_value": float, "pct_per_year": float}
+        {"kind": "irregular", "points": [(year, value), ...]}
+    """
+    if len(points) == 1:
+        y, v = points[0]
+        return {"kind": "single", "year": y, "value": v}
+
+    values = [v for _, v in points]
+    mean_v = sum(values) / len(values)
+
+    if mean_v == 0:
+        if all(v == 0 for v in values):
+            return {"kind": "flat", "value": 0.0}
+    elif max(abs(v - mean_v) for v in values) / mean_v <= _FLAT_TOL:
+        return {"kind": "flat", "value": mean_v}
+
+    scale = max(abs(v) for v in values) or 1.0
+    slopes, ratios = [], []
+    ratios_valid = True
+    for (y1, v1), (y2, v2) in zip(points, points[1:]):
+        dy = y2 - y1
+        if dy <= 0:
+            continue
+        slopes.append((v2 - v1) / dy)
+        if v1 > 0 and v2 > 0:
+            ratios.append((v2 / v1) ** (1.0 / dy))
+        else:
+            ratios_valid = False
+
+    # Score each candidate pattern as (how much of its own tolerance budget it
+    # used, result) - 0.0 is a perfect fit, 1.0 is right at the edge of still
+    # qualifying. A slow percentage-growth sequence (e.g. 5%/yr) has slopes
+    # that only drift a little relative to EACH OTHER, which can still slip
+    # inside a lenient linear tolerance - so rather than accepting the first
+    # pattern that merely qualifies, both are scored and the tighter (lower
+    # relative error) fit wins whenever both qualify.
+    linear_fit = None
+    if slopes:
+        avg_slope = sum(slopes) / len(slopes)
+        if abs(avg_slope) / scale > 1e-6:
+            max_dev = max(abs(s - avg_slope) for s in slopes) / abs(avg_slope)
+            if max_dev <= _SLOPE_TOL:
+                linear_fit = (max_dev / _SLOPE_TOL,
+                             {"kind": "linear", "start_value": values[0], "slope": avg_slope})
+
+    percent_fit = None
+    if ratios_valid and ratios:
+        avg_ratio = sum(ratios) / len(ratios)
+        if abs(avg_ratio - 1.0) > 1e-4:
+            max_dev = max(abs(r - avg_ratio) for r in ratios)
+            if max_dev <= _RATIO_TOL:
+                percent_fit = (max_dev / _RATIO_TOL,
+                               {"kind": "percent", "start_value": values[0],
+                                "pct_per_year": (avg_ratio - 1.0) * 100.0})
+
+    if linear_fit and (not percent_fit or linear_fit[0] <= percent_fit[0]):
+        return linear_fit[1]
+    if percent_fit:
+        return percent_fit[1]
+
+    return {"kind": "irregular", "points": list(points)}
+
+
+def summarize_assumed_row(label: str, kind: str, points: list, rationale_by_year: dict,
+                          currency_symbol: str = "$") -> str:
+    """
+    One short, readable line describing a row's assumed values across years -
+    the pattern (flat / linear step / percentage growth / irregular), not a
+    per-cell restatement. The grid itself remains the source of exact figures;
+    this is only meant to be read alongside it, not instead of it.
+
+    points : [(year, value), ...] - only the row's currently-ASSUMED cells,
+        sorted by year (at least one).
+    rationale_by_year : {year: str} - the per-cell rationale text (e.g. from
+        propose_grid_assumptions), used only to append one short "why" clause,
+        taken from the latest year in ``points`` (most relevant to the trend).
+    """
+    is_money = kind in _MONEY_ROW_KINDS
+    fmt = (lambda v: f"{currency_symbol}{v:,.0f}") if is_money else (lambda v: f"{v:,.0f}")
+    # A literal "$" (from a currency-suffixed label and/or a formatted amount)
+    # reads fine as plain text, but if a line ends up with TWO of them,
+    # Streamlit's markdown renderer treats the pair as inline LaTeX math
+    # delimiters and mangles everything between them. Escape defensively so
+    # this line always renders as plain text regardless of currency.
+    esc = lambda s: s.replace("$", "\\$")
+    label = esc(label)
+
+    pattern = _detect_row_pattern(points)
+    last_year = points[-1][0]
+    why = esc((rationale_by_year.get(last_year) or "").strip())
+
+    if pattern["kind"] == "single":
+        text = f"Assumed **{label}** at {esc(fmt(pattern['value']))} for Year {pattern['year']}."
+    elif pattern["kind"] == "flat":
+        text = f"Assumed **{label}** at {esc(fmt(pattern['value']))}/year, flat across the term."
+    elif pattern["kind"] == "linear":
+        direction = "increasing" if pattern["slope"] >= 0 else "decreasing"
+        text = (f"Assumed **{label}** starting at {esc(fmt(pattern['start_value']))}, "
+                f"{direction} {esc(fmt(abs(pattern['slope'])))}/year.")
+    elif pattern["kind"] == "percent":
+        direction = "growing" if pattern["pct_per_year"] >= 0 else "declining"
+        text = (f"Assumed **{label}** {direction} ~{abs(pattern['pct_per_year']):.0f}%/year "
+                f"from {esc(fmt(pattern['start_value']))}.")
+    else:
+        parts = ", ".join(f"Year {y} = {esc(fmt(v))}" for y, v in pattern["points"])
+        text = f"Assumed **{label}**: {parts}."
+
+    if why:
+        text += f" _{why}_"
+    return text
+
+
+# --------------------------------------------------------------------------- #
+# 3. P&L directly from the confirmed grid - real per-year values into
+#    calculate_profit / calculate_npv / calculate_roi. No re-asking for a flat
+#    CAPEX/OPEX/duration - those come straight from the grid.
+# --------------------------------------------------------------------------- #
+
+def _grid_row(grid_values: dict, name: str, n_years: int) -> list:
+    """A row's values as a plain float list, length n_years+1, blanks treated as 0."""
+    vals = grid_values.get(name) or []
+    return [float(vals[y]) if y < len(vals) and vals[y] is not None else 0.0
+            for y in range(n_years + 1)]
+
+
+def build_pl_from_grid(business_model: str, row_specs: list, grid_values: dict, n_years: int,
+                       license_model_type: str = None, tier_breaks: list = None) -> dict:
+    """
+    Build a year-by-year P&L straight from the confirmed Step-2 grid - no separate
+    scenario/driver re-entry. Per-year Revenue is derived from the grid's own
+    volume/rate rows (model-specific formula below); CAPEX is the grid's CAPEX row;
+    OPEX is the SUM of every row with kind "opex" (one or more line items). Each
+    year's Revenue/CAPEX/OPEX is then run through ``calculate_profit`` (unchanged,
+    reused as-is) to get Gross/Net Profit, and the Net Profit series is exactly
+    what ``compute_npv_roi`` (also unchanged) expects for NPV/ROI.
+
+    Revenue formula by model
+    -------------------------
+    subscription : ending_base[y] * price[y]
+    adtech       : (annual_impressions[y] / 1000) * cpm_rate[y] + annual_clicks[y] * cpc_rate[y]
+    fee_based    : annual_exposure_units[y] * rate_per_unit[y]
+    licensing    : flat     -> rate_or_fee[y] (that year's flat licence fee, volume not multiplied)
+                   per_unit -> volume[y] * rate_or_fee[y]
+                   tiered   -> calculate_licensing_cost("tiered", volume=volume[y], tier_breaks=...)
+                               run once per year against that year's volume (reuses the
+                               verified marginal-bracket calculator unchanged)
+
+    Parameters
+    ----------
+    business_model : one of BUSINESS_MODELS
+    row_specs : list of the grid's row specs (model rows + GRID_CAPEX_ROW + any OPEX
+        line items) - used only to find the OPEX row names (kind == "opex").
+    grid_values : st.session_state.bc_grid_values - {row_name: [float|None, ...]}
+    n_years : grid horizon (grid spans Year 0..n_years)
+    license_model_type, tier_breaks : only used when business_model == "licensing"
 
     Returns
     -------
-    dict with:
-        business_model : str
-        driver_fields  : list[str]
-        headline_key   : str        key into each scenario's ``result``
-        headline_label : str
-        note           : str | None
-        scenarios      : {name: {"multipliers": {...}, "adjusted": {field: value},
-                                 "headline": float, "result": <engine return dict>}}
+    dict with the same shape ``compute_npv_roi`` and the xlsx exporter expect:
+        df               : pandas.DataFrame  rows = Revenue/CAPEX/OPEX/Gross Profit/
+                           Net Profit/Cumulative Cash Flow, cols = Year 0..N
+        business_model, projection_years
+        cash_flows       : list[float]   Net Profit, Year 0..N
+        revenue_by_year, capex_by_year, opex_by_year : list[float]
+        total_capex, total_opex, final_cumulative     : float
+        notes            : list[str]
 
     Raises
     ------
-    BusinessCaseError if a required input is still missing (wraps MissingInputError).
+    BusinessCaseError on an unrecognised business_model or license_model_type.
     """
-    still_missing = missing_fields(business_model, inputs)
-    if still_missing:
-        raise BusinessCaseError(
-            "Cannot run scenarios — still missing: " + ", ".join(still_missing)
+    if business_model == "subscription":
+        ending = _grid_row(grid_values, "ending_base", n_years)
+        price = _grid_row(grid_values, "price", n_years)
+        revenue_by_year = [ending[y] * price[y] for y in range(n_years + 1)]
+
+    elif business_model == "adtech":
+        impressions = _grid_row(grid_values, "annual_impressions", n_years)
+        cpm = _grid_row(grid_values, "cpm_rate", n_years)
+        clicks = _grid_row(grid_values, "annual_clicks", n_years)
+        cpc = _grid_row(grid_values, "cpc_rate", n_years)
+        revenue_by_year = [
+            (impressions[y] / 1000.0) * cpm[y] + clicks[y] * cpc[y] for y in range(n_years + 1)
+        ]
+
+    elif business_model == "fee_based":
+        units = _grid_row(grid_values, "annual_exposure_units", n_years)
+        rate = _grid_row(grid_values, "rate_per_unit", n_years)
+        revenue_by_year = [units[y] * rate[y] for y in range(n_years + 1)]
+
+    elif business_model == "licensing":
+        volume = _grid_row(grid_values, "volume", n_years)
+        rate = _grid_row(grid_values, "rate_or_fee", n_years)
+        lmt = str(license_model_type or "flat").strip().lower()
+        if lmt == "flat":
+            revenue_by_year = list(rate)
+        elif lmt == "per_unit":
+            revenue_by_year = [volume[y] * rate[y] for y in range(n_years + 1)]
+        elif lmt == "tiered":
+            revenue_by_year = [0.0] * (n_years + 1)
+            if tier_breaks:
+                for y in range(n_years + 1):
+                    if volume[y] > 0:
+                        revenue_by_year[y] = calculate_licensing_cost(
+                            model_type="tiered", flat_fee=None, per_unit_fee=None,
+                            volume=volume[y], duration_years=1, tier_breaks=tier_breaks,
+                        )["licensing_cost"]
+        else:
+            raise BusinessCaseError(f"Unknown license_model_type: {license_model_type!r}")
+    else:
+        raise BusinessCaseError(f"Unknown business_model: {business_model!r}")
+
+    capex_by_year = _grid_row(grid_values, "capex", n_years)
+    opex_row_names = [r["name"] for r in row_specs if r.get("kind") == "opex"]
+    opex_by_year = [0.0] * (n_years + 1)
+    for name in opex_row_names:
+        row = _grid_row(grid_values, name, n_years)
+        opex_by_year = [opex_by_year[y] + row[y] for y in range(n_years + 1)]
+
+    notes = []
+    if business_model == "licensing" and str(license_model_type or "flat").lower() == "tiered" \
+       and not tier_breaks:
+        notes.append(
+            "Tiered licence structure has no tier breaks defined - revenue is shown as 0 "
+            "until tier breaks are supplied."
         )
 
-    mult_map = dict(SCENARIO_MULTIPLIERS[business_model])
-    note = None
-    if business_model == "licensing" and not inputs.get("volume"):
-        mult_map = {"flat_fee": (0.9, 1.0, 1.1)}
-        note = ("Flat-fee licence has no volume driver — Low/High shown here are "
-                "+/-10% fee-negotiation uncertainty, not demand sensitivity.")
+    gross_row, net_row = [], []
+    for rev, cx, ox in zip(revenue_by_year, capex_by_year, opex_by_year):
+        p = calculate_profit(revenue=rev, capex=cx, opex=ox)
+        gross_row.append(p["gross_profit"])
+        net_row.append(p["net_profit"])
 
-    scenarios = {}
-    for i, scen in enumerate(SCENARIO_NAMES):
-        scen_inputs = dict(inputs)
-        adjusted = {}
-        multipliers = {}
-        for field, triple in mult_map.items():
-            base = inputs.get(field)
-            if base is None:
-                continue
-            val = base * triple[i]
-            if field in _RATE_FIELDS:
-                val = min(1.0, max(0.0, val))
-            scen_inputs[field] = val
-            adjusted[field] = val
-            multipliers[field] = triple[i]
+    cumulative_row, running = [], 0.0
+    for net in net_row:
+        running += net
+        cumulative_row.append(running)
 
-        try:
-            result = _call_engine(business_model, scen_inputs)
-        except FinancialEngineError as e:
-            raise BusinessCaseError(f"{scen.title()} scenario failed: {e}") from e
-
-        scenarios[scen] = {
-            "multipliers": multipliers,
-            "adjusted": adjusted,
-            "headline": result[_HEADLINE_KEY[business_model]],
-            "result": result,
-        }
+    year_cols = [f"Year {y}" for y in range(n_years + 1)]
+    rows = {
+        "Revenue": revenue_by_year,
+        "CAPEX": capex_by_year,
+        "OPEX": opex_by_year,
+        "Gross Profit": gross_row,
+        "Net Profit": net_row,
+        "Cumulative Cash Flow": cumulative_row,
+    }
+    df = pd.DataFrame.from_dict(rows, orient="index", columns=year_cols)
+    df.index.name = "Attribute"
 
     return {
+        "df": df,
         "business_model": business_model,
-        "driver_fields": list(mult_map),
-        "headline_key": _HEADLINE_KEY[business_model],
-        "headline_label": _HEADLINE_LABEL[business_model],
-        "note": note,
-        "scenarios": scenarios,
+        "projection_years": n_years,
+        "cash_flows": list(net_row),
+        "revenue_by_year": revenue_by_year,
+        "capex_by_year": capex_by_year,
+        "opex_by_year": opex_by_year,
+        "total_capex": sum(capex_by_year),
+        "total_opex": sum(opex_by_year),
+        "final_cumulative": cumulative_row[-1],
+        "notes": notes,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 4. NPV / ROI
+# --------------------------------------------------------------------------- #
+
+
+def compute_npv_roi(pl_model: dict, discount_rate: float = 0.10) -> dict:
+    """
+    NPV and ROI from a built P&L.
+
+    - NPV: ``calculate_npv`` on the per-year Net Profit series (Year 0..N), which is
+      the first difference of Cumulative Cash Flow.
+    - ROI: ``calculate_roi`` with net_profit = final Cumulative Cash Flow and
+      total_investment = total CAPEX + total OPEX over the horizon (total cash
+      deployed). If that base is 0, ROI is reported as unavailable rather than raising.
+
+    Returns {"npv": {...}, "roi": {...} | None, "discount_rate", "investment_base"}.
+    """
+    npv = calculate_npv(pl_model["cash_flows"], discount_rate=discount_rate)
+
+    investment_base = pl_model["total_capex"] + pl_model["total_opex"]
+    roi = None
+    if investment_base > 0:
+        roi = calculate_roi(
+            net_profit=pl_model["final_cumulative"], total_investment=investment_base
+        )
+
+    return {
+        "npv": npv,
+        "roi": roi,
+        "discount_rate": discount_rate,
+        "investment_base": investment_base,
     }
 
 
@@ -594,33 +865,71 @@ if __name__ == "__main__":
         "minimum_volume": "50,000 units per 12-month period",
     }
 
-    print("=== prefill (subscription) ===")
-    print(json.dumps(prefill_inputs_from_extraction("subscription", example_extraction), indent=2, default=str))
+    print("\n=== year-by-year grid (subscription): default years + prefill ===")
+    n_years = default_grid_years(example_extraction)
+    print("  default_grid_years:", n_years)
+    row_specs = MODEL_GRID_ROWS["subscription"] + [GRID_CAPEX_ROW]
+    prefill = prefill_grid_cells("subscription", example_extraction, row_specs, n_years)
+    print("  prefill:", json.dumps(prefill, indent=2, default=str))
 
-    print("\n=== required / missing (subscription) ===")
-    inputs = {"duration_years": 3.0, "new_customers_per_year": 50_000}
-    print("required:", required_fields("subscription", inputs))
-    print("missing :", missing_fields("subscription", inputs))
-
-    print("\n=== scenarios (subscription, all inputs hardcoded) ===")
-    inputs = {
-        "new_customers_per_year": 50_000, "price": 120.0,
-        "activation_rate": 0.4, "annual_churn_rate": 0.15, "duration_years": 3,
+    print("\n=== subscription waterfall roll-forward ===")
+    grid_values = {
+        "beginning_base": [0.0] + [None] * n_years,
+        "new_added": [None] + [(prefill.get("new_added") or {}).get(y, {}).get("value") for y in range(1, n_years + 1)],
+        "churned_out": [None] + [5_000.0] * n_years,
     }
-    out = run_scenarios("subscription", inputs)
-    for name, s in out["scenarios"].items():
-        print(f"  {name:<7} adjusted={ {k: round(v, 4) for k, v in s['adjusted'].items()} }  "
-              f"{out['headline_label']}: {s['headline']:,.0f}")
+    recompute_subscription_waterfall(grid_values, n_years)
+    for y in range(n_years + 1):
+        print(f"  Year {y}: beginning={grid_values['beginning_base'][y]:,.0f}  "
+              f"new={grid_values['new_added'][y] or 0:,.0f}  "
+              f"churned={grid_values['churned_out'][y] or 0:,.0f}  "
+              f"ending={grid_values['ending_base'][y]:,.0f}")
 
-    print("\n=== scenarios (licensing per_unit) ===")
-    lic = {"license_model_type": "per_unit", "per_unit_fee": 75.0, "volume": 150_000, "duration_years": 3}
-    out = run_scenarios("licensing", lic)
-    for name, s in out["scenarios"].items():
-        print(f"  {name:<7} adjusted={s['adjusted']}  {out['headline_label']}: {s['headline']:,.0f}")
+    print("\n=== fallback grid cell (no Groq) ===")
+    v, why = _fallback_grid_cell("volume", "New customers added", 2, [None, 50_000.0, None, None])
+    print(f"  volume Year 2 projected from Year 1: {v:,.0f}  -- {why}")
+    v, why = _fallback_grid_cell("capex", "CAPEX", 1, [200_000.0, None, None])
+    print(f"  capex Year 1 (no further CAPEX assumed): {v:,.0f}  -- {why}")
+    v, why = _fallback_grid_cell("rate", "Annual revenue per active customer ($)", 0, [None, None])
+    print(f"  rate Year 0 with no known values anywhere: {v:,.2f}  -- {why}")
 
-    print("\n=== scenarios (licensing flat — no volume driver) ===")
-    lic = {"license_model_type": "flat", "flat_fee": 1_200_000.0, "duration_years": 3}
-    out = run_scenarios("licensing", lic)
-    print("  note:", out["note"])
-    for name, s in out["scenarios"].items():
-        print(f"  {name:<7} adjusted={s['adjusted']}  {out['headline_label']}: {s['headline']:,.0f}")
+    print("\n=== build_pl_from_grid (subscription, 3yr) ===")
+    sub_row_specs = MODEL_GRID_ROWS["subscription"] + [GRID_CAPEX_ROW,
+                                                        {"name": "opex__0__opex", "kind": "opex"}]
+    sub_grid_values = {
+        "beginning_base": [0.0, 0.0, 45000.0, 90000.0],
+        "new_added": [0.0, 50000.0, 50000.0, 50000.0],
+        "churned_out": [0.0, 5000.0, 5000.0, 5000.0],
+        "ending_base": [0.0, 45000.0, 90000.0, 135000.0],
+        "price": [0.0, 120.0, 126.0, 132.0],
+        "capex": [2_000_000.0, 0.0, 0.0, 0.0],
+        "opex__0__opex": [0.0, 3_500_000.0, 3_500_000.0, 3_500_000.0],
+    }
+    pl_grid = build_pl_from_grid("subscription", sub_row_specs, sub_grid_values, 3)
+    print(pl_grid["df"].to_string(float_format=lambda x: f"{x:,.0f}"))
+    print("  cash_flows:", [round(c) for c in pl_grid["cash_flows"]])
+    nr_grid = compute_npv_roi(pl_grid, discount_rate=0.10)
+    print(f"  NPV @10%: {nr_grid['npv']['npv']:,.0f}")
+    print(f"  ROI: {nr_grid['roi']['roi_pct']:.1f}%" if nr_grid["roi"] else "  ROI: n/a")
+
+    print("\n=== build_pl_from_grid (licensing, per_unit, 3yr) ===")
+    lic_row_specs = [{"name": "volume", "kind": "volume"}, {"name": "rate_or_fee", "kind": "rate"},
+                     GRID_CAPEX_ROW, {"name": "opex__0__opex", "kind": "opex"}]
+    lic_grid_values = {
+        "volume": [0.0, 50000.0, 50000.0, 50000.0],
+        "rate_or_fee": [0.0, 75.0, 78.0, 81.0],
+        "capex": [500_000.0, 0.0, 0.0, 0.0],
+        "opex__0__opex": [0.0, 1_000_000.0, 1_000_000.0, 1_000_000.0],
+    }
+    pl_lic = build_pl_from_grid("licensing", lic_row_specs, lic_grid_values, 3,
+                                license_model_type="per_unit")
+    print(pl_lic["df"].to_string(float_format=lambda x: f"{x:,.0f}"))
+
+    print("\n=== build_pl_from_grid (licensing, tiered, 3yr) ===")
+    pl_tier = build_pl_from_grid(
+        "licensing", lic_row_specs, lic_grid_values, 3, license_model_type="tiered",
+        tier_breaks=[{"min_units": 0, "rate_per_unit": 100}, {"min_units": 30_000, "rate_per_unit": 80}],
+    )
+    print(pl_tier["df"].loc["Revenue"].to_string())
+    for n in pl_tier["notes"]:
+        print("  note:", n)
