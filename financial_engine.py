@@ -887,7 +887,7 @@ Search results:
 Return ONLY a JSON object with exactly these keys:
 - "typical_low_usd": number or null - low end of the typical PUBLIC per-unit license price, USD.
 - "typical_high_usd": number or null - high end of the typical PUBLIC per-unit license price, USD.
-- "basis": string - what one unit is (e.g. "per GPU", "per vehicle", "per seat/year"). "" if unclear.
+- "basis": string - what one unit is (e.g. "per GPU", "per device", "per seat/year"). "" if unclear.
 - "quoted_text": string - the price line you used, quoted verbatim. "" if none.
 - "source_result_number": integer or null - which numbered result the quote came from.
 
@@ -963,7 +963,7 @@ def _licensing_sanity_check(effective_per_unit, product_description, tavily_clie
         "source_url": source_url,
         "label": label,
         "note": (
-            "Public list pricing rarely matches a negotiated OEM deal (volume discounts, "
+            "Public list pricing rarely matches a negotiated enterprise deal (volume discounts, "
             "bundling, strategic terms). Use this only to decide whether to double-check "
             "the negotiated number, not as evidence it is right or wrong."
         ),
@@ -975,8 +975,8 @@ def calculate_licensing_cost(model_type, flat_fee, per_unit_fee, volume, duratio
                              tavily_client=None, groq_client=None, model="openai/gpt-oss-120b",
                              max_results=5):
     """
-    Cost of a software / IP license an OEM pays to a provider (e.g. an NVIDIA-style
-    per-unit chip/software license, or a flat platform license).
+    Cost of a software / IP license a licensee pays to a provider (e.g. a per-unit
+    royalty on each unit shipped, or a flat platform license).
 
     Deterministic by default. If ``run_sanity_check=True`` it *also* does a rough,
     clearly-labelled Tavily/Groq comparison against public list pricing - that

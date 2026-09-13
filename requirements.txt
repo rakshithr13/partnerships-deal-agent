@@ -1,5 +1,9 @@
 streamlit==1.61.1
 streamlit-aggrid==1.2.1.post2
+fastapi==0.141.1
+uvicorn==0.52.1
+python-multipart==0.0.32
+pydantic-settings==2.15.0
 pandas==3.0.5
 altair==6.2.2
 chromadb==1.5.9

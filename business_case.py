@@ -27,6 +27,7 @@ import json
 import pandas as pd
 
 from financial_engine import (
+    MissingInputError,
     calculate_licensing_cost,
     calculate_npv,
     calculate_profit,
@@ -81,11 +82,11 @@ deal as exactly one of:
 
 - "subscription": the partner earns a recurring per-customer/per-seat fee (often with activation and churn).
 - "adtech": the partner earns media revenue priced on impressions (CPM) and/or clicks (CPC).
-- "fee_based": the partner earns a flat fee per exposure unit (per vehicle, per transaction, per API call, per device) with no CPM/CPC and no recurring-subscriber mechanic.
-- "licensing": one party pays another a software / IP licence fee (flat, per-unit royalty, or tiered) - e.g. an OEM licensing a chip/software platform.
+- "fee_based": the partner earns a flat fee per exposure unit (per unit, per transaction, per API call, per device, per shipment) with no CPM/CPC and no recurring-subscriber mechanic.
+- "licensing": one party pays another a software / IP licence fee (flat, per-unit royalty, or tiered) - e.g. one company licensing another's software or hardware platform.
 
 Also identify the deal's currency and whether it looks cross-border (the provider and the \
-counterparty/OEM appear to sit in different currency regions - e.g. different currency symbols/codes \
+counterparty appear to sit in different currency regions - e.g. different currency symbols/codes \
 used in the text, or party names/context implying different home countries).
 
 Extracted term sheet (JSON):
@@ -198,9 +199,10 @@ _MODEL_SIGNAL_KEYWORDS = {
         "fill rate", "per thousand", "per mille", "media revenue",
     ],
     "fee_based": [
-        "flat fee", "fee per", "per-unit fee", "per unit fee", "per vehicle",
+        "flat fee", "fee per", "per-unit fee", "per unit fee", "per unit sold",
         "per transaction", "per device", "per api", "per call", "per connected",
-        "usage fee", "usage-based", "per activation fee",
+        "per shipment", "per order", "per record", "per query", "per install",
+        "usage fee", "usage-based", "metered", "per activation fee",
     ],
     "licensing": [
         "licens", "royalt", "intellectual property", "ip ownership", "sublicens",
@@ -211,7 +213,7 @@ _MODEL_SIGNAL_KEYWORDS = {
 MODEL_SIGNAL_HINT = {
     "subscription": "subscriber / recurring-fee / churn / activation language",
     "adtech": "CPM / CPC / impressions / clicks / ad-inventory language",
-    "fee_based": "flat fee-per-unit language (per vehicle / transaction / device / call)",
+    "fee_based": "flat fee-per-unit language (per unit / transaction / device / call)",
     "licensing": "licence / royalty / IP-ownership language",
 }
 
@@ -290,9 +292,9 @@ MODEL_GRID_ROWS = {
         {"name": "cpc_rate", "label": "CPC rate ({cur} / click)", "kind": "rate"},
     ],
     "fee_based": [
-        {"name": "annual_exposure_units", "label": "Annual unit volume (vehicles / transactions / devices)",
+        {"name": "annual_exposure_units", "label": "Annual unit volume (units / transactions / devices)",
          "kind": "volume", "prefill": "annual_volume",
-         "help": "Vehicles / transactions / devices / API calls billed in the year."},
+         "help": "Billable units - transactions, devices, API calls, shipments - in the year."},
         {"name": "rate_per_unit", "label": "Fee per unit ({cur})", "kind": "rate"},
     ],
     "licensing": [
@@ -673,10 +675,33 @@ def summarize_assumed_row(label: str, kind: str, points: list, rationale_by_year
 # --------------------------------------------------------------------------- #
 
 def _grid_row(grid_values: dict, name: str, n_years: int) -> list:
-    """A row's values as a plain float list, length n_years+1, blanks treated as 0."""
-    vals = grid_values.get(name) or []
-    return [float(vals[y]) if y < len(vals) and vals[y] is not None else 0.0
-            for y in range(n_years + 1)]
+    """A row's values as a plain float list, length n_years+1.
+
+    Every cell must hold a real number. A missing row, a too-short row, or a blank
+    (``None``) cell raises ``MissingInputError`` naming the exact gaps. Substituting
+    0.0 would be indistinguishable from a genuine zero and would quietly skew revenue,
+    profit, NPV and ROI with no indication anything was wrong.
+
+    Only the rows a given model/licence structure actually consumes are read, so a
+    row that plays no part in the calculation is never required.
+    """
+    vals = grid_values.get(name)
+    if vals is None:
+        raise MissingInputError(
+            f"grid_values has no {name!r} row, which this business model requires for "
+            f"Year 0 through Year {n_years}."
+        )
+
+    missing = [y for y in range(n_years + 1) if y >= len(vals) or vals[y] is None]
+    if missing:
+        cells = ", ".join(f"Year {y}" for y in missing)
+        raise MissingInputError(
+            f"{name!r} has no value for {cells}. Every cell must hold a real figure "
+            "before the P&L can be built - use 0 for a genuinely-zero year rather than "
+            "leaving it blank, or fill the gap with a clearly-labelled assumption."
+        )
+
+    return [float(vals[y]) for y in range(n_years + 1)]
 
 
 def build_pl_from_grid(business_model: str, row_specs: list, grid_values: dict, n_years: int,
@@ -723,7 +748,11 @@ def build_pl_from_grid(business_model: str, row_specs: list, grid_values: dict, 
 
     Raises
     ------
-    BusinessCaseError on an unrecognised business_model or license_model_type.
+    BusinessCaseError  on an unrecognised business_model or license_model_type.
+    MissingInputError  if any cell this model actually consumes is blank (None),
+        absent, or beyond the end of a short row - naming the row and the exact
+        years. Blanks are never silently read as 0, because a substituted zero is
+        indistinguishable from a real one and would quietly skew the whole P&L.
     """
     if business_model == "subscription":
         ending = _grid_row(grid_values, "ending_base", n_years)
@@ -745,14 +774,18 @@ def build_pl_from_grid(business_model: str, row_specs: list, grid_values: dict, 
         revenue_by_year = [units[y] * rate[y] for y in range(n_years + 1)]
 
     elif business_model == "licensing":
-        volume = _grid_row(grid_values, "volume", n_years)
-        rate = _grid_row(grid_values, "rate_or_fee", n_years)
+        # Each structure reads only the rows it actually uses: a flat licence fee
+        # ignores volume, and a tiered one ignores the royalty row. Reading both up
+        # front would demand figures that cannot affect the result.
         lmt = str(license_model_type or "flat").strip().lower()
         if lmt == "flat":
-            revenue_by_year = list(rate)
+            revenue_by_year = list(_grid_row(grid_values, "rate_or_fee", n_years))
         elif lmt == "per_unit":
+            volume = _grid_row(grid_values, "volume", n_years)
+            rate = _grid_row(grid_values, "rate_or_fee", n_years)
             revenue_by_year = [volume[y] * rate[y] for y in range(n_years + 1)]
         elif lmt == "tiered":
+            volume = _grid_row(grid_values, "volume", n_years)
             revenue_by_year = [0.0] * (n_years + 1)
             if tier_breaks:
                 for y in range(n_years + 1):

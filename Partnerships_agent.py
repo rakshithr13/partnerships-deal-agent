@@ -15,7 +15,9 @@ import pandas as pd
 from st_aggrid import AgGrid, DataReturnMode, GridOptionsBuilder, GridUpdateMode, JsCode
 
 import business_case as bc
-from financial_engine import generate_pl_chart, fetch_fx_rate, FinancialEngineError
+from financial_engine import (
+    generate_pl_chart, fetch_fx_rate, FinancialEngineError, MissingInputError,
+)
 from termsheet_extractor import extract_termsheet, ExtractionError
 from risk_engine import build_risk_register, RiskEngineError
 
@@ -58,16 +60,18 @@ tab1, tab2, tab3 = st.tabs([
 # TAB 1: MARKET INTELLIGENCE & COMPETITOR ANALYSIS
 # ==========================================
 with tab1:
-    target_company = st.text_input("Target Partner Company:", "Valeo")
-    if st.button("Run Market & Competitor Scan"):
+    target_company = st.text_input(
+        "Target Partner Company:", value="", placeholder="e.g. Acme Corporation",
+    ).strip()
+    if st.button("Run Market & Competitor Scan", disabled=not target_company):
         with st.spinner("Analyzing partner strategy and identifying competitors..."):
             # Pass 1: Partner Scan
-            partner_res = tavily.search(query=f"{target_company} strategic priorities partnerships automotive",
+            partner_res = tavily.search(query=f"{target_company} strategic priorities partnerships",
                                         max_results=3)
             partner_text = "\n".join([r['content'] for r in partner_res['results']])
 
             # Pass 2: Competitor Scan
-            comp_res = tavily.search(query=f"top direct competitors of {target_company} automotive news", max_results=3)
+            comp_res = tavily.search(query=f"top direct competitors of {target_company} news", max_results=3)
             comp_text = "\n".join([r['content'] for r in comp_res['results']])
 
             intel_prompt = f"""
@@ -98,7 +102,9 @@ with tab2:
     st.subheader("1. Ingest New MSA into Portfolio")
     col1, col2 = st.columns(2)
     with col1:
-        partner_name = st.text_input("Partner Name for this MSA:", "Bosch")
+        partner_name = st.text_input(
+            "Partner Name for this MSA:", value="", placeholder="e.g. Acme Corporation",
+        ).strip()
     with col2:
         uploaded_file = st.file_uploader("Upload MSA (PDF/DOCX)", type=["pdf", "docx"])
 
@@ -931,9 +937,11 @@ with tab3:
                     st.session_state.bc_grid_confirmed = True
                     st.rerun()
             elif remaining_blanks:
-                st.caption(
-                    f"{len(remaining_blanks)} cell(s) are currently blank — Step 3 below treats "
-                    "them as 0 until you fill them in."
+                st.warning(
+                    f"{len(remaining_blanks)} cell(s) are currently blank. Step 3 can't be "
+                    "recalculated until every cell holds a figure — enter one, or use "
+                    "**Fill remaining blanks with assumptions**. (Enter 0 for a genuinely "
+                    "zero year; a blank is not read as 0.)"
                 )
 
             # --- Step 3 — P&L computed live from the grid's current values ------
@@ -945,6 +953,10 @@ with tab3:
                         model, row_specs, st.session_state.bc_grid_values, n_years,
                         license_model_type=lmt, tier_breaks=st.session_state.bc_inputs.get("tier_breaks"),
                     )
+                except MissingInputError as e:
+                    # A blank cell is no longer silently read as 0, so say which one.
+                    st.error(f"Can't build the P&L yet — {e}")
+                    pl = None
                 except bc.BusinessCaseError as e:
                     st.error(str(e))
                     pl = None
@@ -955,7 +967,7 @@ with tab3:
                     if model == "licensing":
                         st.caption(
                             "For a licence deal the **Revenue** row is the licence fee the "
-                            "provider receives (equivalently, the OEM's licensing cost)."
+                            "provider receives (equivalently, the licensee's licensing cost)."
                         )
                     st.dataframe(_bc_format_money_df(pl["df"], currency_symbol), width="stretch")
 

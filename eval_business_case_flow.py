@@ -1,12 +1,18 @@
 """
 Eval harness for business_case.py — exercised directly, NOT through Streamlit.
 
-Runs the three Groq-and-engine functions end to end for five hand-built deals:
+Runs the current grid-based flow end to end for five hand-built deals:
 
-    classify_business_model  ->  must return the expected model
-    propose_assumptions      ->  every generated value must carry source: "groq" | "fallback"
-    (assemble inputs)        ->  no required financial_engine field may be silently None
-    run_scenarios            ->  low / medium / high headline values must NOT all be equal
+    classify_business_model         ->  must return the expected model
+    prefill_grid_cells              ->  term-sheet volume lands in the right cells
+    recompute_subscription_waterfall->  ending = beginning + new - churned, rolled forward
+    propose_grid_assumptions        ->  fills ONLY blank cells; never overwrites a
+                                        pre-filled or user-entered value
+    (assembled grid)                ->  no cell reaching financial_engine may be None
+                                        (build_pl_from_grid silently treats None as 0)
+    build_pl_from_grid              ->  per-year revenue must vary where the deal's
+    + compute_npv_roi                   economics say it should, and the P&L identities
+                                        must hold
 
 Prints a pass/fail line per check, a verdict per case, and a summary count.
 Exit code is 0 only if every case passes.
@@ -26,15 +32,18 @@ from dotenv import load_dotenv
 from groq import Groq
 
 import business_case as bc
+from financial_engine import FinancialEngineError
 
 
 # --------------------------------------------------------------------------- #
 # Test cases
 # --------------------------------------------------------------------------- #
 # Each case: a term-sheet extraction + risk register, the expected classification,
-# and `user_inputs` = the real figures a user would confirm (the ones that can be
-# neither pre-filled from the term sheet nor responsibly assumed). The harness then
-# lets prefill + propose_assumptions fill the rest, exactly like the UI flow.
+# and `user_cells` = the real figures a user would type into the grid (the ones that
+# can be neither pre-filled from the term sheet nor responsibly assumed). The harness
+# then lets prefill + propose_grid_assumptions fill the rest, exactly like the UI flow.
+#
+# user_cells values: a scalar applies to every year 0..N; a dict applies per year index.
 
 def _extraction(**overrides):
     base = {
@@ -76,8 +85,10 @@ CASES = [
             {"risk_name": "Missing contract term: IP_Ownership", "severity": "high"},
             {"risk_name": "Minimum volume commitment without stated penalty/waiver terms", "severity": "medium"},
         ],
-        # price per active customer per YEAR (12.99 * 12); can't be assumed from norms.
-        "user_inputs": {"price": 155.88},
+        # price per active subscriber per YEAR (12.99 * 12); can't be assumed from norms.
+        # beginning_base year 0 = 0 -> brand-new partnership, no existing base.
+        "user_cells": {"price": 155.88, "beginning_base": {0: 0.0}},
+        "expect_revenue_variation": True,
     },
     {
         "name": "adtech_display_network",
@@ -99,79 +110,85 @@ CASES = [
         "risks": [
             {"risk_name": "Missing contract term: minimum_volume", "severity": "low"},
         ],
-        # raw traffic volumes can't be assumed; CPM/CPC are left for propose_assumptions.
-        "user_inputs": {"annual_impressions": 800_000_000, "annual_clicks": 4_000_000},
+        # raw traffic volumes can't be assumed; CPM/CPC are left for the assumption pass.
+        "user_cells": {"annual_impressions": 800_000_000, "annual_clicks": 4_000_000},
+        "expect_revenue_variation": True,
     },
     {
-        "name": "fee_based_telematics",
+        "name": "fee_based_metered_api",
         "expected_model": "fee_based",
         "extraction": _extraction(
-            partner_name="Orbit Telematics",
-            contract_duration_months=None,  # deliberately absent -> propose_assumptions fills duration
-            revenue_share="Provider receives a flat fee of $3.50 per connected vehicle per year",
+            partner_name="Halcyon Data Exchange",
+            contract_duration_months=None,  # deliberately absent -> default_grid_years falls back to 3
+            revenue_share="Provider receives a flat fee of $0.004 per API call served",
             revenue_share_details=(
-                "A single flat per-vehicle fee. No revenue share, no CPM/CPC, no subscriber "
-                "activation/churn mechanic, no software licence."
+                "A single flat per-call fee, metered monthly. No revenue share, no CPM/CPC, "
+                "no per-seat or subscriber activation/churn mechanic, no software licence."
             ),
-            minimum_volume="900,000 connected vehicles per year",
+            # Deliberately absent: with no volume commitment in the term sheet there is
+            # nothing to pre-fill, so call volume must come from the assumption engine --
+            # which is what makes the variation check below actually exercise it.
+            minimum_volume=None,
             exclusivity="Exclusive within North America",
-            payment_terms="Annual fee invoiced quarterly",
+            payment_terms="Monthly invoicing in arrears on metered call volume",
         ),
         "risks": [
             {"risk_name": "Exclusivity commitment", "severity": "high"},
             {"risk_name": "Missing contract term: contract_duration_months", "severity": "medium"},
+            {"risk_name": "Missing contract term: minimum_volume", "severity": "low"},
         ],
-        # per-unit fee is negotiated, not assumable.
-        "user_inputs": {"rate_per_unit": 3.50},
+        # per-call fee is negotiated, not assumable; call volume is left to the engine.
+        "user_cells": {"rate_per_unit": 0.004},
+        # Revenue = assumed call volume x pinned rate, so a flat result here would mean
+        # the assumption engine returned a lazy constant series instead of a ramp.
+        "expect_revenue_variation": True,
     },
     {
-        "name": "licensing_per_unit_autonomy_stack",
+        "name": "licensing_per_unit_embedded_sdk",
         "expected_model": "licensing",
+        "license_model_type": "per_unit",
         "extraction": _extraction(
-            partner_name="Vanta Silicon",
-            contract_duration_months=None,   # -> propose_assumptions fills duration
+            partner_name="Vanta Software",
+            contract_duration_months=None,
             revenue_share=(
-                "OEM pays Provider a per-unit software licence royalty of $60 for each vehicle "
-                "equipped with the Provider autonomy stack."
+                "Licensee pays Provider a per-unit software licence royalty of $60 for each "
+                "unit shipped with the Provider embedded SDK."
             ),
-            revenue_share_details="Royalty per equipped vehicle. Provider retains all platform IP.",
-            minimum_volume=None,             # -> volume must come from user_inputs
+            revenue_share_details="Royalty per unit shipped. Provider retains all platform IP.",
+            minimum_volume=None,             # -> volume must come from user_cells
             exclusivity=None,
             payment_terms="Royalty reported and paid quarterly",
-            IP_Ownership="Provider retains all IP; OEM receives a non-transferable licence.",
+            IP_Ownership="Provider retains all IP; Licensee receives a non-transferable licence.",
         ),
         "risks": [
             {"risk_name": "Missing contract term: exclusivity", "severity": "high"},
         ],
-        "user_inputs": {
-            "license_model_type": "per_unit",
-            "per_unit_fee": 60.0,
-            "volume": 1_200_000,  # total equipped vehicles over the term
-        },
+        "user_cells": {"rate_or_fee": 60.0, "volume": 400_000},
+        "expect_revenue_variation": False,  # user pins both drivers flat across years
     },
     {
         "name": "licensing_flat_platform_fee",
         "expected_model": "licensing",
+        "license_model_type": "flat",
         "extraction": _extraction(
             partner_name="Helix Platform",
             contract_duration_months=36,
             revenue_share=(
-                "OEM pays Provider a fixed annual platform licence fee of $4,000,000, invoiced "
+                "Licensee pays Provider a fixed annual platform licence fee of $4,000,000, invoiced "
                 "quarterly. There is no per-unit or revenue-share component."
             ),
             revenue_share_details="Flat annual fee, independent of volume.",
             minimum_volume=None,
             exclusivity=None,
             payment_terms="Quarterly instalments",
-            IP_Ownership="Provider owns platform IP; OEM granted a non-transferable licence.",
+            IP_Ownership="Provider owns platform IP; Licensee granted a non-transferable licence.",
         ),
         "risks": [
             {"risk_name": "Missing contract term: termination_terms", "severity": "high"},
         ],
-        "user_inputs": {
-            "license_model_type": "flat",
-            "flat_fee": 4_000_000.0,
-        },
+        # A flat annual fee is flat by definition, so revenue SHOULD be constant here.
+        "user_cells": {"rate_or_fee": 4_000_000.0},
+        "expect_revenue_variation": False,
     },
 ]
 
@@ -198,99 +215,184 @@ class CheckLog:
             print(line)
 
 
-def _assemble_inputs(model, extraction, user_inputs, groq_client, log):
-    """Reproduce the UI flow: prefill -> user figures -> propose -> apply -> validate."""
-    inputs = {}
+def _row_specs(model, license_model_type=None):
+    """Model rows + CAPEX + a single OPEX line item, as the UI assembles them."""
+    rows = [dict(r) for r in bc.MODEL_GRID_ROWS[model]]
+    if model == "licensing":
+        for r in rows:
+            if r["name"] == "rate_or_fee":
+                r["label"] = ("Annual flat licence fee ({cur})"
+                              if license_model_type == "flat"
+                              else "Royalty per licensed unit ({cur})")
+    rows.append(dict(bc.GRID_CAPEX_ROW))
+    rows.append({"name": "opex__0__opex", "label": bc.DEFAULT_OPEX_LABEL, "kind": "opex"})
+    return rows
 
-    # 1. deterministic pre-fill from the term sheet
-    prefill = bc.prefill_inputs_from_extraction(model, extraction)
-    for field, info in prefill.items():
-        inputs[field] = info["value"]
 
-    # 2. the real figures the user confirms (authoritative)
-    inputs.update(user_inputs)
+def _blank_grid(row_specs, n_years):
+    values = {r["name"]: [None] * (n_years + 1) for r in row_specs}
+    states = {r["name"]: ["blank"] * (n_years + 1) for r in row_specs}
+    return values, states
 
-    # 3. propose assumptions for whatever is still missing
-    missing = bc.missing_fields(model, inputs)
-    proposed = bc.propose_assumptions(model, extraction, missing, groq_client)
 
-    # --- CHECK: every proposed value is labelled groq | fallback, never bare ---
-    unlabelled = [
-        f for f, info in proposed.items()
-        if not isinstance(info, dict) or info.get("source") not in ("groq", "fallback")
+def _mark_computed(states, n_years):
+    for y in range(1, n_years + 1):
+        states["beginning_base"][y] = "computed"
+    for y in range(n_years + 1):
+        states["ending_base"][y] = "computed"
+
+
+def _editable_cells(row_specs, states, n_years):
+    """Every (row, year) a user or the assumption pass is allowed to fill."""
+    return [
+        (r["name"], y)
+        for r in row_specs
+        for y in range(n_years + 1)
+        if states[r["name"]][y] != "computed"
     ]
-    if proposed:
-        tag_summary = ", ".join(
-            f"{f}[{proposed[f]['source']}"
-            + ("/none]" if proposed[f]["value"] is None else "]")
-            for f in proposed
-        )
-    else:
-        tag_summary = "none proposed"
-    log.check(
-        "propose_assumptions labelling",
-        not unlabelled,
-        f"{len(proposed)} proposed: {tag_summary}" if not unlabelled
-        else f"unlabelled: {unlabelled}",
-    )
-
-    # 4. apply proposed values (only where we don't already have one)
-    for field, info in proposed.items():
-        if info["value"] is not None and inputs.get(field) is None:
-            inputs[field] = info["value"]
-
-    # --- CHECK: no required financial_engine field is silently None ---
-    required = bc.required_fields(model, inputs)
-    none_fields = [f for f in required if inputs.get(f) is None
-                   or (f == "tier_breaks" and not inputs.get(f))]
-    log.check(
-        "no required field is None",
-        not none_fields,
-        f"{len(required)} required: {', '.join(required)}" if not none_fields
-        else f"still None: {none_fields}",
-    )
-
-    return inputs, none_fields
 
 
 def run_case(case, groq_client):
-    print(f"\n[{case['name']}]  expecting model = {case['expected_model']!r}")
+    model = case["expected_model"]
+    license_type = case.get("license_model_type")
+    print(f"\n[{case['name']}]  expecting model = {model!r}")
     log = CheckLog()
-    model_for_flow = case["expected_model"]
+
+    extraction = case["extraction"]
+    n_years = bc.default_grid_years(extraction)
+    row_specs = _row_specs(model, license_type)
 
     # --- CHECK 1: classification ---
     try:
-        cls = bc.classify_business_model(case["extraction"], case["risks"], groq_client)
+        cls = bc.classify_business_model(extraction, case["risks"], groq_client)
         got = cls["business_model"]
-        log.check(
-            "classify_business_model",
-            got == case["expected_model"],
-            f"got {got!r}, confidence {cls['confidence']!r}",
-        )
+        log.check("classify_business_model", got == model,
+                  f"got {got!r}, confidence {cls['confidence']!r}")
     except bc.BusinessCaseError as e:
         log.check("classify_business_model", False, f"error: {e}")
 
-    # --- CHECK 2 + 3: assemble inputs (prefill / propose labelling / no None) ---
-    inputs, none_fields = _assemble_inputs(
-        model_for_flow, case["extraction"], case["user_inputs"], groq_client, log
+    values, states = _blank_grid(row_specs, n_years)
+
+    # --- CHECK 2: deterministic pre-fill from the term sheet ---
+    prefill = bc.prefill_grid_cells(model, extraction, row_specs, n_years)
+    for row, cells in prefill.items():
+        for year, info in cells.items():
+            values[row][year] = info["value"]
+            states[row][year] = "prefilled"
+    expect_prefill = extraction.get("minimum_volume") is not None
+    got_prefill = bool(prefill)
+    log.check(
+        "prefill_grid_cells",
+        got_prefill == expect_prefill,
+        (f"{sum(len(c) for c in prefill.values())} cell(s) from minimum_volume"
+         if got_prefill else "nothing to pre-fill (no minimum_volume)"),
     )
 
-    # --- CHECK 4: three distinct scenario headlines ---
-    if none_fields:
-        log.check("run_scenarios headlines not all equal", False,
-                  "skipped — inputs incomplete")
+    # the user's own authoritative figures
+    for row, spec in case["user_cells"].items():
+        cells = spec if isinstance(spec, dict) else {y: spec for y in range(n_years + 1)}
+        for year, val in cells.items():
+            values[row][year] = float(val)
+            states[row][year] = "user"
+
+    if model == "subscription":
+        bc.recompute_subscription_waterfall(values, n_years)
+        _mark_computed(states, n_years)
+
+    # snapshot everything already known, to prove the assumption pass leaves it alone
+    known = {(r, y): values[r][y]
+             for r in values for y in range(n_years + 1)
+             if states[r][y] in ("prefilled", "user")}
+
+    # --- CHECK 3: assumptions fill ONLY blanks, never overwrite ---
+    proposals = bc.propose_grid_assumptions(
+        model, extraction, row_specs, values, states, n_years, groq_client
+    )
+    targeted_known = [
+        f"{row}[Y{year}]" for row, cells in proposals.items() for year in cells
+        if (row, year) in known
+    ]
+    log.check(
+        "assumptions target only blanks",
+        not targeted_known,
+        f"{sum(len(c) for c in proposals.values())} proposed, {len(known)} known cells untouched"
+        if not targeted_known else f"would overwrite: {targeted_known}",
+    )
+
+    for row, cells in proposals.items():
+        for year, info in cells.items():
+            values[row][year] = info["value"]
+            states[row][year] = "assumed"
+    if model == "subscription":
+        bc.recompute_subscription_waterfall(values, n_years)
+        _mark_computed(states, n_years)
+
+    # --- CHECK 4: known values survived byte-for-byte ---
+    clobbered = [f"{r}[Y{y}] {v} -> {values[r][y]}"
+                 for (r, y), v in known.items() if values[r][y] != v]
+    log.check("no silent overwrites", not clobbered,
+              f"{len(known)} pre-filled/user cells intact" if not clobbered
+              else f"changed: {clobbered}")
+
+    # --- CHECK 5: subscription waterfall arithmetic ---
+    if model == "subscription":
+        beg, new, churn, end = (values["beginning_base"], values["new_added"],
+                                values["churned_out"], values["ending_base"])
+        bad = []
+        for y in range(n_years + 1):
+            expected_end = (beg[y] or 0) + (new[y] or 0) - (churn[y] or 0)
+            if abs((end[y] or 0) - expected_end) > 1e-6:
+                bad.append(f"Y{y}: {end[y]} != {expected_end}")
+            if y > 0 and abs((beg[y] or 0) - (end[y - 1] or 0)) > 1e-6:
+                bad.append(f"Y{y}: beginning {beg[y]} != prior ending {end[y-1]}")
+        log.check("waterfall rolls forward", not bad,
+                  f"ending base {[round(v) for v in end]}" if not bad else "; ".join(bad))
+
+    # --- CHECK 6: nothing reaching financial_engine is None ---
+    # build_pl_from_grid's _grid_row turns a None into 0.0 without complaint, so a gap
+    # here becomes a quietly-wrong P&L rather than an error.
+    nones = [f"{r}[Y{y}]" for r, y in _editable_cells(row_specs, states, n_years)
+             if values[r][y] is None]
+    log.check("no None reaches financial_engine", not nones,
+              f"{len(_editable_cells(row_specs, states, n_years))} cells all populated"
+              if not nones else f"still None: {nones}")
+
+    # --- CHECK 7: P&L + NPV/ROI ---
+    if nones:
+        log.check("build_pl_from_grid + compute_npv_roi", False, "skipped — grid incomplete")
+        log.check("revenue varies across years", False, "skipped — grid incomplete")
     else:
         try:
-            out = bc.run_scenarios(model_for_flow, inputs)
-            heads = {name: out["scenarios"][name]["headline"] for name in bc.SCENARIO_NAMES}
-            distinct = len(set(round(v, 6) for v in heads.values())) >= 2
-            log.check(
-                "run_scenarios headlines not all equal",
-                distinct,
-                "low={low:,.0f}  med={medium:,.0f}  high={high:,.0f}".format(**heads),
+            pl = bc.build_pl_from_grid(model, row_specs, values, n_years,
+                                       license_model_type=license_type)
+            nr = bc.compute_npv_roi(pl, discount_rate=0.10)
+
+            rev, cap, opx = pl["revenue_by_year"], pl["capex_by_year"], pl["opex_by_year"]
+            identities_ok = (
+                len(pl["cash_flows"]) == n_years + 1
+                and all(abs(pl["cash_flows"][y] - (rev[y] - opx[y] - cap[y])) < 1e-6
+                        for y in range(n_years + 1))
+                and abs(nr["investment_base"] - (pl["total_capex"] + pl["total_opex"])) < 1e-6
+                and len(nr["npv"]["discounted_by_year"]) == n_years + 1
             )
-        except bc.BusinessCaseError as e:
-            log.check("run_scenarios headlines not all equal", False, f"error: {e}")
+            roi_txt = f"{nr['roi']['roi_pct']:,.1f}%" if nr["roi"] else "n/a (zero investment)"
+            log.check("build_pl_from_grid + compute_npv_roi", identities_ok,
+                      f"NPV {nr['npv']['npv']:,.0f}, ROI {roi_txt}")
+
+            # --- CHECK 8: variation where the deal's economics imply it ---
+            operating = [round(v, 6) for v in rev[1:]] or [0.0]
+            varies = len(set(operating)) > 1
+            expected = case["expect_revenue_variation"]
+            log.check(
+                "revenue varies across years", varies == expected,
+                f"{'varies' if varies else 'flat'} as expected: "
+                f"{[round(v) for v in rev]}"
+                if varies == expected else
+                f"expected {'variation' if expected else 'flat'}, got {[round(v) for v in rev]}",
+            )
+        except (bc.BusinessCaseError, FinancialEngineError) as e:
+            log.check("build_pl_from_grid + compute_npv_roi", False, f"error: {e}")
+            log.check("revenue varies across years", False, "skipped — P&L failed")
 
     log.dump()
     verdict = "CASE PASS" if log.ok else "CASE FAIL"
